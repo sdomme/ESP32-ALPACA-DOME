@@ -1,0 +1,5 @@
+# Personal settings (WiFi credentials, local pinout) - see config_default.h
+ESP32_DOME_CONTROLLER/config_local.h
+
+# Personal notes and wiring of the own installation
+local/

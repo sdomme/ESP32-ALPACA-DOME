@@ -1,5 +1,9 @@
 # ESP32 ASCOM Alpaca Dome (Roll-off Roof) & Safety Controller
 
+> **Fork with extensions:** light barrier as alternative park sensor, configurable pins
+> and relay polarity, optional dedicated "open" output, park check enforced by the dome
+> itself. See [Fork Extensions](#fork-extensions). Sketch folder: `ESP32_DOME_CONTROLLER/`.
+
 A modern, wireless replacement for the classic Rolling Roof Computer Interface (RRCI),
 built on a single ESP32 dev board and the ASCOM Alpaca standard. No Windows drivers,
 no USB cables — just WiFi.
@@ -17,17 +21,16 @@ The controller presents itself to your astronomy software (NINA, Voyager, SGP) a
 two distinct Alpaca devices:
 
 - **Dome Device** — Handles roof movement (Open/Close)
-- **Safety Monitor** — Exposes the physical "Mount Parked" sensor state
+- **Safety Monitor** — Exposes the physical "Mount Parked" sensor state (reed park sensor only)
 
-> **Important:** Dome Alpaca endpoints (Open/Close) do **not** enforce the park
-> sensor and behave like a classic RRCI controller.
+> **Important:** Dome Alpaca endpoints (Open/Close) check the park sensor before every
+> move and reject the command with an error message if the mount is not parked. Only the
+> Web UI override buttons skip this check.
 >
-> The Safety Monitor device exposes the park sensor state. Users who want interlocks
-> should configure their automation software (e.g. NINA "Safety Monitor") to require
-> this device to be **safe** before issuing dome commands.
->
-> If you want to block roof movement when the mount is not parked, you **must** use
-> the Safety Monitor driver in your astronomy software.
+> The Safety Monitor device (reed park sensor only) exposes the park sensor state. Imaging
+> software usually uses a Safety Monitor to decide whether observing is safe (e.g. NINA
+> sequences that loop "while safe") — a "mount parked" sensor reports unsafe during the
+> whole session, so it is usually not suitable as the main Safety Monitor.
 
 ---
 
@@ -59,7 +62,10 @@ two distinct Alpaca devices:
 
 ## Pinout & Wiring
 
-> All sensors use internal `INPUT_PULLUP`. Wire them to switch to **GND** when active.
+> All sensors use internal `INPUT_PULLUP`. Wire them to switch to **GND** when active
+> (default; active-HIGH sensors are supported via `ROOF_INPUT_ACTIVE_LEVEL` /
+> `PARK_INPUT_ACTIVE_LEVEL`, which switches the pin to `INPUT_PULLDOWN`).
+> Default pinout (`config_default.h`); all pins can be changed in the configuration.
 
 | Function | GPIO | Wiring |
 |---|---|---|
@@ -72,12 +78,56 @@ two distinct Alpaca devices:
 
 ## Configuration
 
-Open the sketch and locate the `// ========= USER SETTINGS =========` section.
+Copy `ESP32_DOME_CONTROLLER/config_default.h` to `ESP32_DOME_CONTROLLER/config_local.h`
+and edit the copy. `config.h` uses `config_local.h` if it exists; it is listed in
+`.gitignore`, so your WiFi credentials and pinout are never committed.
 
-- **CRITICAL:** Set `ssid` and `password` to match your observatory's WiFi network
+- **CRITICAL:** Set `WIFI_SSID` and `WIFI_PASSWORD` to match your observatory's WiFi network
+- Choose the park sensor (`PARK_SENSOR_TYPE`), pins, relay polarity and timings
 - Default port: `11111`
 - Static IP is not yet implemented in the sketch (see [TODO](#todo)); it is recommended
   to assign a static IP via your router's DHCP reservation using the ESP32's MAC address
+
+---
+
+## Fork Extensions
+
+### Light barrier as park sensor (`PARK_SENSOR_BEAM`)
+
+For mounts without space for a reed switch: an IR light barrier is placed so that an
+unparked telescope interrupts the beam. Its receiver contact (closed = beam clear) goes to
+`PARK_SAFE_PIN` and GND, its supply is switched by a relay on `PARK_POWER_PIN`.
+
+Before every Open/Close the controller
+
+1. reads the contact while the light barrier is unpowered — it must read "interrupted",
+   otherwise the signal line is shorted (`PARK_BEAM_SELFTEST`),
+2. powers the light barrier for `PARK_BEAM_SETTLE_MS` and reads the contact,
+3. switches the light barrier off again and only then triggers the motor.
+
+The light barrier is therefore lit for about one second per move and cannot disturb
+exposures. Because it cannot be read between moves, no Safety Monitor device is offered in
+this mode; use an external Safety Monitor (weather / cloud / rain sensor) in your software.
+
+The light barrier is a sensor for the ESP32 only — do not wire it into the safety input of
+the motor controller.
+
+### Motor controller and relays
+
+- `RELAY_PIN`: impulse on a single-button input (open / stop / close), as in the original.
+- `OPEN_RELAY_PIN`: optional dedicated "open only" input, if the controller has one.
+- `RELAY_ACTIVE_LEVEL`: `HIGH` or `LOW` depending on the relay board.
+- `ROOF_INPUT_ACTIVE_LEVEL` / `PARK_INPUT_ACTIVE_LEVEL`: level of an active input
+  (default `LOW` = contact to GND with pull-up; `HIGH` = active-high sensor with pull-down).
+
+### Roof logic
+
+- Roof contacts are debounced (`REED_DEBOUNCE_MS`).
+- Abort sends a stop impulse (after `PULSE_GAP_MS`).
+- Timeout, wrong direction (single-button input started between the end positions),
+  both contacts active and unexpected movement are reported as `shutterError` with a
+  reason, shown in the Web UI and returned to Alpaca clients.
+- Open/Close are accepted from the error state, so the roof can be recovered remotely.
 
 ---
 
