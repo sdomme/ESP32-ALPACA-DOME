@@ -1,0 +1,5 @@
+# WiFi credentials (see arduino_secrets.h.example)
+arduino_secrets.h
+
+# Arduino IDE "Export Compiled Binary" output
+build/
