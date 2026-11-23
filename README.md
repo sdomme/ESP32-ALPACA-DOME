@@ -48,7 +48,8 @@ Pins are set in the `PIN DEFINITIONS` section of the sketch.
 
 ## Setup (Arduino IDE)
 
-1. Install the ESP32 board package and the libraries `ESPAsyncWebServer`, `AsyncTCP`, `ArduinoJson`.
+1. Install the ESP32 board package (core 3.x) and the libraries **ESP Async WebServer** and **Async TCP**
+   (both by ESP32Async; older forks do not compile with core 3.x) and **ArduinoJson**.
 2. Copy `arduino_secrets.h.example` to `arduino_secrets.h` and enter your WiFi
    (the file is gitignored; the sketch does not compile without it).
 3. Board settings: **ESP32S3 Dev Module**, Flash Size **16MB**, PSRAM **Disabled**,
@@ -56,11 +57,12 @@ Pins are set in the `PIN DEFINITIONS` section of the sketch.
 4. Flash via USB once. Later updates: *Sketch → Export Compiled Binary*, then upload the
    `.bin` from `build/` at `http://<ip>:11111/update`.
 
-Further settings (timeouts, hostname, discovery) are at the top of the sketch.
+Further settings (timeouts, hostname, discovery, time zone) are at the top of the sketch.
 
 ## Usage
 
 - Web UI: `http://<ip>:11111/`
+- Diagnostics: `http://<ip>:11111/diag` (event log with NTP time, survives reboots but not power loss; WiFi, heap, last Alpaca request)
 - NINA finds Dome and Safety Monitor via Alpaca discovery in the same network.
 
 ## Safety

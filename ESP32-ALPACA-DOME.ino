@@ -22,6 +22,8 @@
 // Deliberately no fallback: a build without real credentials would lose WiFi after an OTA update.
 #include "arduino_secrets.h"
 #define WIFI_HOSTNAME          "esp32-dome"
+#define NTP_SERVER             "pool.ntp.org"
+#define TIME_ZONE              "CET-1CEST,M3.5.0,M10.5.0/3"   // POSIX TZ string (Central Europe), used for /diag times
  
 #define ENABLE_DISCOVERY       true     // Alpaca UDP discovery (NINA finds the device without an IP)
  
@@ -30,6 +32,7 @@
 #define WIFI_RETRY_INTERVAL     30000UL  // while disconnected: reconnect attempt this often
 #define WIFI_REBOOT_AFTER_MS    600000UL // still no WiFi after 10 min: reboot (only if the roof is idle)
 #define WDT_TIMEOUT_S           10       // loop() must run at least this often, otherwise the chip resets
+#define ALPACA_CLIENT_OK_S      30       // web UI shows "Alpaca Client: OK" if a client polled within this time
 #define RELAY_PULSE_MS          1000UL
 #define RELAY_PULSE_GAP_MS      500UL    // pause before a queued stop pulse, so the controller sees two presses
 #define RELAY_ACTIVE_LEVEL      HIGH     // Waveshare ESP32-S3-Relay-6CH: HIGH = relay on
@@ -107,9 +110,18 @@ DebouncedSwitch parkSw       = { PARK_SAFE_PIN,   PARK_CONFIRM_MS, true,  false,
 uint32_t serverTransactionID = 0;   // only incremented by the web server task
 unsigned long lastWifiCheck = 0;
 bool wifiDown = false;
+bool wifiEverUp = false;
 unsigned long wifiDownSince = 0;
+uint32_t wifiLosses = 0;
+volatile uint8_t wifiDisconnectReason = 0;   // set by the WiFi event handler
+volatile unsigned long lastAlpacaMs = 0;
+volatile bool alpacaSeen = false;
 volatile bool restartPending = false;
+const char* restartReason = "";
 unsigned long restartRequestedAt = 0;
+// Roof events are raised inside the critical section and logged from loop()
+const char* volatile roofEvent = "";
+volatile uint32_t roofEventSeq = 0;
 volatile bool otaInProgress = false;
 volatile unsigned long otaLastChunkAt = 0;
 bool otaRejected = false;
@@ -121,8 +133,19 @@ AsyncWebServer *server = NULL;
 AsyncUDP udp;
 Preferences preferences;
  
+// ========= DIAGNOSTICS: event log in RTC memory =========
+// Survives software restarts, watchdog resets and crashes; cleared on power-on.
+#define DIAG_MAGIC    0x44494147UL   // "DIAG"
+#define DIAG_EVENTS   32
+#define DIAG_TEXT_LEN 72
+ 
+struct DiagEvent { uint32_t epoch; uint32_t uptimeS; uint16_t boot; char text[DIAG_TEXT_LEN]; };
+struct DiagLog { uint32_t magic; uint32_t bootCount; uint16_t next; uint16_t count; DiagEvent ev[DIAG_EVENTS]; };
+RTC_NOINIT_ATTR DiagLog diag;
+portMUX_TYPE diagMux = portMUX_INITIALIZER_UNLOCKED;
+ 
 // ========= HTML (Minified) =========
-const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>ESP32 Dome Control</title><style> *, *::before, *::after { box-sizing: border-box; } body, html { margin: 0; padding: 0; height: 100%; background-color: #121212; color: #eee; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu, sans-serif; display: flex; justify-content: center; align-items: flex-start; padding: 1rem 0.5rem; user-select: none; } main { width: 100%; max-width: 400px; background: #1c1c1c; border: 1px solid #333; box-shadow: inset 0 0 8px #222, 0 0 16px #0a84ff33; padding: 16px 20px; display: flex; flex-direction: column; gap: 1rem; color: #ddd; } header { text-align: center; } header h1 { font-weight: 600; font-size: 1.4rem; letter-spacing: 0.12em; margin-bottom: 6px; color: #0af; } header p { font-size: 0.8rem; color: #555; margin-top: -4px; letter-spacing: 0.08em; } #domestatus { margin-top: 8px; font-weight: 700; text-transform: uppercase; font-size: 1.2rem; letter-spacing: 0.12em; padding: 6px 0; border-top: 1px solid #333; border-bottom: 1px solid #333; } .status-open { color: #6cf98b; } .status-closed { color: #5c98fc; } .status-opening, .status-closing { color: #ffcc00; } .status-unknown { color: #ff5252; } .status-error { color: #ff5252; } section { display: flex; flex-direction: column; gap: 0.6rem; } .sensor { display: flex; justify-content: space-between; gap: 1rem; font-family: monospace; font-size: 0.95rem; padding: 4px 0; border-bottom: 1px solid #2a2a2a; } .sensor:last-child { border-bottom: none; } .sensor-name { color: #999; text-transform: uppercase; letter-spacing: 0.07em; font-weight: 600; } .sensor-value { font-weight: 700; text-align: right; } .trig { color: #5ce35c; } .notrig { color: #666; } .error { color: #ff4f4f; } .safe-status { text-align: center; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; padding: 6px 0; user-select: none; } .safe-status.safe { color: #6cf98b; border-top: 1px solid #3a7d3a; border-bottom: 1px solid #3a7d3a; } .safe-status.notSafe { color: #ff5252; border-top: 1px solid #7d3a3a; border-bottom: 1px solid #7d3a3a; } button { width: 100%; padding: 14px 12px; background: #222; border: none; color: #ddd; font-size: 1rem; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; cursor: pointer; transition: background 0.15s ease; user-select: none; border-left: 3px solid transparent; outline-offset: 2px; } button:focus-visible { outline: 2px solid #0af; outline-offset: 3px; } button:active:not(:disabled) { background: #333; } button:disabled { background: #111; color: #555; cursor: default; border-left: 3px solid #444; } #sopenbtn { border-left-color: #6cf98b; margin-bottom: 10px; } #sclosebtn { border-left-color: #5c98fc; } .override-btn { font-size: 0.84rem; font-weight: 500; padding: 10px 12px; background: #111; color: #999; border-left: 3px solid transparent; } .override-btn:enabled:hover { color: #0af; border-left-color: #0af; background: #191919; } .override-btn:disabled { color: #333; border-left-color: #333; cursor: default; background: #111; } .override-wrap { display: flex; justify-content: space-between; gap: 10px; margin-top: 0.6rem; } .override-wrap div { flex: 1; } .note { font-size: 0.8rem; color: #555; user-select: none; padding-top: 0.6rem; border-top: 1px solid #333; line-height: 1.3; letter-spacing: 0.02em; } </style></head><body><main role="main"><header><h1>ESP32 Dome Control</h1><p>Remote roof controller</p><div id="domestatus" class="status-error">Loading...</div></header><section><div id="safetystatus" class="safe-status notSafe">Loading...</div></section><section><button id="sopenbtn" onclick="postCmd('/sopen')">Open Dome</button><button id="sclosebtn" onclick="postCmd('/sclose')">Close Dome</button></section><section class="override-wrap"><div><button id="openbtn" onclick="confirmOverride('/open')" class="override-btn">Override Open</button></div><div><button id="closebtn" onclick="confirmOverride('/close')" class="override-btn">Override Close</button></div></section><section><div class="sensor"><div class="sensor-name">Roof Open</div><div id="roofopen" class="sensor-value notrig">Loading</div></div><div class="sensor"><div class="sensor-name">Roof Closed</div><div id="roofclosed" class="sensor-value notrig">Loading</div></div><div class="sensor"><div class="sensor-name">Park Light Barrier</div><div id="parksensor" class="sensor-value error">Loading</div></div><div class="sensor"><div class="sensor-name">Last Reset</div><div id="resetreason" class="sensor-value notrig">Loading</div></div><div class="sensor"><div class="sensor-name">Fault</div><div id="faulttext" class="sensor-value">-</div></div></section><section><button id="resetfault" onclick="resetFault()" class="override-btn">Reset Fault</button></section><div class="note"><strong>Note:</strong> Safe dome open/close buttons require the mount to be parked. Override commands ignore the park sensor and work regardless. <a href="/update" style="color:#555">Firmware update</a></div></main><script> async function confirmOverride(url) { const closing = url === '/close'; const msg = closing ? 'OVERRIDE CLOSE\n\nMount park confirmation is bypassed. The roof can collide with your telescope.\n\nProceed with override close?' : 'OVERRIDE OPEN\n\nMount park confirmation is bypassed. Check roof clearance and mount position.\n\nProceed with override open?'; if (!window.confirm(msg)) return; try { const armed = await fetch('/override/arm?direction=' + (closing ? 'close' : 'open'), {method:'POST',cache:'no-store'}); if (!armed.ok) throw new Error(await armed.text()); const data = await armed.json(); const res = await fetch(url + '?token=' + encodeURIComponent(data.token), {method:'POST',cache:'no-store'}); if (!res.ok) throw new Error(await res.text()); updateStatus(); } catch (e) { alert('Override rejected: ' + e.message); } } async function resetFault() { if (!window.confirm('Reset the fault latch after checking the roof and sensor positions?')) return; const r = await fetch('/fault/reset', {method:'POST'}); if (!r.ok) alert('Reset rejected: ' + await r.text()); updateStatus(); } function postCmd(url) { fetch(url, { method: 'POST' }) .then(async response => { if (!response.ok) alert('Command rejected: ' + await response.text()); }) .catch(error => console.error('Error:', error)); } function updateStatus() { fetch('/status', {cache: 'no-store'}) .then(res => res.json()) .then(data => { const domeStatusEl = document.getElementById('domestatus'); domeStatusEl.textContent = data.domeStatus || 'ERROR'; domeStatusEl.className = 'status-' + ((data.domeStatus || '').toLowerCase()); const safeEl = document.getElementById('safetystatus'); safeEl.textContent = data.safetyStatus || 'Error'; safeEl.className = data.safetySafe ? 'safe-status safe' : 'safe-status notSafe'; const roofOpenEl = document.getElementById('roofopen'); roofOpenEl.textContent = data.roofOpen ? 'Triggered' : 'Not triggered'; roofOpenEl.className = 'sensor-value ' + (data.roofOpen ? 'trig' : 'notrig'); const roofClosedEl = document.getElementById('roofclosed'); roofClosedEl.textContent = data.roofClosed ? 'Triggered' : 'Not triggered'; roofClosedEl.className = 'sensor-value ' + (data.roofClosed ? 'trig' : 'notrig'); const parkEl = document.getElementById('parksensor'); parkEl.textContent = data.parkConfirmed ? 'Scope parked' : (data.parkBlocked ? 'Verifying (' + (data.parkProgressMs / 1000).toFixed(1) + '/10 s)' : 'Scope NOT parked'); document.getElementById('faulttext').textContent = data.fault || 'none'; document.getElementById('resetreason').textContent = data.resetReason + ', up ' + Math.floor(data.uptimeS / 60) + ' min'; document.getElementById('resetfault').disabled = !data.faultLatched; parkEl.className = 'sensor-value ' + (data.parkConfirmed ? 'trig' : 'error'); document.getElementById('sopenbtn').disabled = !!data.roofOpen || !data.safetySafe; document.getElementById('sclosebtn').disabled = !!data.roofClosed || !data.safetySafe; document.getElementById('openbtn').disabled = !!data.roofOpen; document.getElementById('closebtn').disabled = !!data.roofClosed; }) .catch(() => { document.getElementById('domestatus').textContent = 'ERROR (Conn)'; }); } setInterval(updateStatus, 2000); window.addEventListener('load', updateStatus); </script></body></html>)rawliteral";
+const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>ESP32 Dome Control</title><style> *, *::before, *::after { box-sizing: border-box; } body, html { margin: 0; padding: 0; height: 100%; background-color: #121212; color: #eee; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu, sans-serif; display: flex; justify-content: center; align-items: flex-start; padding: 1rem 0.5rem; user-select: none; } main { width: 100%; max-width: 400px; background: #1c1c1c; border: 1px solid #333; box-shadow: inset 0 0 8px #222, 0 0 16px #0a84ff33; padding: 16px 20px; display: flex; flex-direction: column; gap: 1rem; color: #ddd; } header { text-align: center; } header h1 { font-weight: 600; font-size: 1.4rem; letter-spacing: 0.12em; margin-bottom: 6px; color: #0af; } header p { font-size: 0.8rem; color: #555; margin-top: -4px; letter-spacing: 0.08em; } #domestatus { margin-top: 8px; font-weight: 700; text-transform: uppercase; font-size: 1.2rem; letter-spacing: 0.12em; padding: 6px 0; border-top: 1px solid #333; border-bottom: 1px solid #333; } .status-open { color: #6cf98b; } .status-closed { color: #5c98fc; } .status-opening, .status-closing { color: #ffcc00; } .status-unknown { color: #ff5252; } .status-error { color: #ff5252; } section { display: flex; flex-direction: column; gap: 0.6rem; } .sensor { display: flex; justify-content: space-between; gap: 1rem; font-family: monospace; font-size: 0.95rem; padding: 4px 0; border-bottom: 1px solid #2a2a2a; } .sensor:last-child { border-bottom: none; } .sensor-name { color: #999; text-transform: uppercase; letter-spacing: 0.07em; font-weight: 600; } .sensor-value { font-weight: 700; text-align: right; } .trig { color: #5ce35c; } .notrig { color: #666; } .error { color: #ff4f4f; } .safe-status { text-align: center; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; padding: 6px 0; user-select: none; } .safe-status.safe { color: #6cf98b; border-top: 1px solid #3a7d3a; border-bottom: 1px solid #3a7d3a; } .safe-status.notSafe { color: #ff5252; border-top: 1px solid #7d3a3a; border-bottom: 1px solid #7d3a3a; } button { width: 100%; padding: 14px 12px; background: #222; border: none; color: #ddd; font-size: 1rem; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; cursor: pointer; transition: background 0.15s ease; user-select: none; border-left: 3px solid transparent; outline-offset: 2px; } button:focus-visible { outline: 2px solid #0af; outline-offset: 3px; } button:active:not(:disabled) { background: #333; } button:disabled { background: #111; color: #555; cursor: default; border-left: 3px solid #444; } #sopenbtn { border-left-color: #6cf98b; margin-bottom: 10px; } #sclosebtn { border-left-color: #5c98fc; } .override-btn { font-size: 0.84rem; font-weight: 500; padding: 10px 12px; background: #111; color: #999; border-left: 3px solid transparent; } .override-btn:enabled:hover { color: #0af; border-left-color: #0af; background: #191919; } .override-btn:disabled { color: #333; border-left-color: #333; cursor: default; background: #111; } .override-wrap { display: flex; justify-content: space-between; gap: 10px; margin-top: 0.6rem; } .override-wrap div { flex: 1; } .note { font-size: 0.8rem; color: #555; user-select: none; padding-top: 0.6rem; border-top: 1px solid #333; line-height: 1.3; letter-spacing: 0.02em; } </style></head><body><main role="main"><header><h1>ESP32 Dome Control</h1><p>Remote roof controller</p><div id="domestatus" class="status-error">Loading...</div></header><section><div id="safetystatus" class="safe-status notSafe">Loading...</div></section><section><button id="sopenbtn" onclick="postCmd('/sopen')">Open Dome</button><button id="sclosebtn" onclick="postCmd('/sclose')">Close Dome</button></section><section class="override-wrap"><div><button id="openbtn" onclick="confirmOverride('/open')" class="override-btn">Override Open</button></div><div><button id="closebtn" onclick="confirmOverride('/close')" class="override-btn">Override Close</button></div></section><section><div class="sensor"><div class="sensor-name">Roof Open</div><div id="roofopen" class="sensor-value notrig">Loading</div></div><div class="sensor"><div class="sensor-name">Roof Closed</div><div id="roofclosed" class="sensor-value notrig">Loading</div></div><div class="sensor"><div class="sensor-name">Park Light Barrier</div><div id="parksensor" class="sensor-value error">Loading</div></div><div class="sensor"><div class="sensor-name">Last Reset</div><div id="resetreason" class="sensor-value notrig">Loading</div></div><div class="sensor"><div class="sensor-name">Alpaca Client</div><div id="alpaca" class="sensor-value notrig">Loading</div></div><div class="sensor"><div class="sensor-name">Fault</div><div id="faulttext" class="sensor-value">-</div></div></section><section><button id="resetfault" onclick="resetFault()" class="override-btn">Reset Fault</button></section><div class="note"><strong>Note:</strong> Safe dome open/close buttons require the mount to be parked. Override commands ignore the park sensor and work regardless. <a href="/update" style="color:#555">Firmware update</a> | <a href="/diag" style="color:#555">Diagnostics</a></div></main><script> let lastStatus = {}; async function confirmOverride(url) { const closing = url === '/close'; const msg = closing ? 'OVERRIDE CLOSE\n\nMount park confirmation is bypassed. The roof can collide with your telescope.\n\nProceed with override close?' : 'OVERRIDE OPEN\n\nMount park confirmation is bypassed. Check roof clearance and mount position.\n\nProceed with override open?'; const warn = lastStatus.nextPulse === 'unknown' ? 'DIRECTION UNKNOWN: the next pulse may move the roof either way.\n\n' : ''; if (!window.confirm(warn + msg)) return; try { const armed = await fetch('/override/arm?direction=' + (closing ? 'close' : 'open'), {method:'POST',cache:'no-store'}); if (!armed.ok) throw new Error(await armed.text()); const data = await armed.json(); const res = await fetch(url + '?token=' + encodeURIComponent(data.token), {method:'POST',cache:'no-store'}); if (!res.ok) throw new Error(await res.text()); updateStatus(); } catch (e) { alert('Override rejected: ' + e.message); } } async function resetFault() { if (!window.confirm('Reset the fault latch after checking the roof and sensor positions?')) return; const r = await fetch('/fault/reset', {method:'POST'}); if (!r.ok) alert('Reset rejected: ' + await r.text()); updateStatus(); } function postCmd(url) { fetch(url, { method: 'POST' }) .then(async response => { if (!response.ok) alert('Command rejected: ' + await response.text()); }) .catch(error => console.error('Error:', error)); } function updateStatus() { fetch('/status', {cache: 'no-store'}) .then(res => res.json()) .then(data => { lastStatus = data; const domeStatusEl = document.getElementById('domestatus'); domeStatusEl.textContent = data.domeStatus || 'ERROR'; domeStatusEl.className = 'status-' + ((data.domeStatus || '').toLowerCase()); const safeEl = document.getElementById('safetystatus'); safeEl.textContent = data.safetyStatus || 'Error'; safeEl.className = data.safetySafe ? 'safe-status safe' : 'safe-status notSafe'; const roofOpenEl = document.getElementById('roofopen'); roofOpenEl.textContent = data.roofOpen ? 'Triggered' : 'Not triggered'; roofOpenEl.className = 'sensor-value ' + (data.roofOpen ? 'trig' : 'notrig'); const roofClosedEl = document.getElementById('roofclosed'); roofClosedEl.textContent = data.roofClosed ? 'Triggered' : 'Not triggered'; roofClosedEl.className = 'sensor-value ' + (data.roofClosed ? 'trig' : 'notrig'); const parkEl = document.getElementById('parksensor'); parkEl.textContent = data.parkConfirmed ? 'Scope parked' : (data.parkBlocked ? 'Verifying (' + (data.parkProgressMs / 1000).toFixed(1) + '/10 s)' : 'Scope NOT parked'); document.getElementById('faulttext').textContent = data.fault || 'none'; const al = document.getElementById('alpaca'); const alOk = !!data.alpacaOk; al.textContent = alOk ? 'OK' : (data.alpacaAgeS < 0 ? '-- (never)' : '-- (' + data.alpacaAgeS + ' s ago)'); al.className = 'sensor-value ' + (alOk ? 'trig' : 'notrig'); document.getElementById('resetreason').textContent = data.resetReason + ', up ' + Math.floor(data.uptimeS / 60) + ' min'; document.getElementById('resetfault').disabled = !data.faultLatched; parkEl.className = 'sensor-value ' + (data.parkConfirmed ? 'trig' : 'error'); document.getElementById('sopenbtn').disabled = !!data.roofOpen || !data.safetySafe; document.getElementById('sclosebtn').disabled = !!data.roofClosed || !data.safetySafe; document.getElementById('openbtn').disabled = !!data.roofOpen; document.getElementById('closebtn').disabled = !!data.roofClosed; }) .catch(() => { document.getElementById('domestatus').textContent = 'ERROR (Conn)'; }); } setInterval(updateStatus, 2000); window.addEventListener('load', updateStatus); </script></body></html>)rawliteral";
  
 const char SETUP_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><body><form action="/setup/save" method="POST" style="background:#222;color:#eee;padding:20px;font-family:sans-serif">
@@ -202,6 +225,7 @@ bool triggerRelay() {
 void latchRoofFault(const char* why) {
   if (roofLost) return;   // preserve the first cause
   roofLost = true; roofErrorReason = why; faultAt = millis();
+  roofEvent = why; roofEventSeq = roofEventSeq + 1;
   currentShutterState = SHUTTER_ERROR; isSlewing = false;
 }
  
@@ -209,6 +233,7 @@ void latchRoofFault(const char* why) {
 void setPositionUnknown(const char* why, NextPulse next) {
   currentShutterState = SHUTTER_ERROR; isSlewing = false;
   roofErrorReason = why; nextPulse = next;
+  roofEvent = why; roofEventSeq = roofEventSeq + 1;
 }
  
 void setEndPosition(bool open) {
@@ -218,10 +243,39 @@ void setEndPosition(bool open) {
   stopPending = false;   // at an end switch a stop pulse would start the motor again
 }
  
-// One serial line per roof command (never call inside the critical section)
+bool timeSynced(time_t t) { return t > 1704067200; }   // after 2024-01-01: NTP has set the clock
+ 
+void diagInit() {
+  if (diag.magic != DIAG_MAGIC || esp_reset_reason() == ESP_RST_POWERON) {
+    memset(&diag, 0, sizeof(diag));
+    diag.magic = DIAG_MAGIC;
+  }
+  diag.bootCount++;
+}
+ 
+// Serial line, optionally also stored in the RTC event log (never call inside stateMux)
+void logEvent(bool store, const char* fmt, ...) {
+  char text[128];
+  va_list args;
+  va_start(args, fmt); vsnprintf(text, sizeof(text), fmt, args); va_end(args);
+  Serial.println(text);
+  if (!store) return;
+  time_t now = time(nullptr);
+  portENTER_CRITICAL(&diagMux);
+  DiagEvent &e = diag.ev[diag.next];
+  e.epoch = timeSynced(now) ? (uint32_t)now : 0;
+  e.uptimeS = millis() / 1000;
+  e.boot = diag.bootCount;
+  strncpy(e.text, text, DIAG_TEXT_LEN - 1); e.text[DIAG_TEXT_LEN - 1] = 0;
+  diag.next = (diag.next + 1) % DIAG_EVENTS;
+  if (diag.count < DIAG_EVENTS) diag.count++;
+  portEXIT_CRITICAL(&diagMux);
+}
+ 
+// One line per roof command (never call inside the critical section)
 void logCommand(const char* source, const char* action, const char* err, const char* okText) {
-  if (err) Serial.printf("[CMD] %s %s: rejected (%s)\n", source, action, err);
-  else     Serial.printf("[CMD] %s %s: %s\n", source, action, okText);
+  if (err) logEvent(true, "[CMD] %s %s: rejected (%s)", source, action, err);
+  else     logEvent(true, "[CMD] %s %s: %s", source, action, okText);
 }
  
 // ========= ROOF COMMANDS =========
@@ -316,6 +370,8 @@ void updateRoofState() {
     }
     else if (currentShutterState == SHUTTER_OPENING && roofOpenSw.active)   setEndPosition(true);
     else if (currentShutterState == SHUTTER_CLOSING && roofClosedSw.active) setEndPosition(false);
+    // Back at the start end switch after leaving it, or at it after starting between the switches
+    else if (!startedAtEnd && startSw.active) latchRoofFault("Moved in wrong direction");
     // Start switch never released: the pulse did not reach the controller or the motor did not run
     else if (startedAtEnd && !stopPending && millis() - lastCommandTime > ROOF_START_TIMEOUT_MS) setPositionUnknown("Did not move", PULSE_UNKNOWN);
     else if (millis() - lastCommandTime > ROOF_TIMEOUT_MS) setPositionUnknown("Travel timeout", PULSE_UNKNOWN);
@@ -329,19 +385,87 @@ void updateRoofState() {
  
 // Serial output is not allowed inside the critical section, so log changes from loop()
 void logStateChanges() {
-  static const char* loggedWhy = "";
+  static uint32_t loggedEventSeq = 0;
   static const char* loggedStatus = "";
   static bool loggedRelay = false;
   static bool loggedPark = false;
  
-  const char* why = roofErrorReason;
-  if (why != loggedWhy) { loggedWhy = why; if (*why) Serial.printf("[ROOF] %s\n", why); }
+  uint32_t seq = roofEventSeq;
+  if (seq != loggedEventSeq) { loggedEventSeq = seq; logEvent(true, "[ROOF] %s", (const char*)roofEvent); }
   const char* status = domeStatusStr();   // returns string literals, so comparing pointers is enough
-  if (status != loggedStatus) { loggedStatus = status; Serial.printf("[STATE] %s\n", status); }
+  if (status != loggedStatus) { loggedStatus = status; logEvent(true, "[STATE] %s", status); }
   bool relay = relayActive;
-  if (relay != loggedRelay) { loggedRelay = relay; Serial.println(relay ? "[RELAY] pulse on" : "[RELAY] pulse off"); }
+  if (relay != loggedRelay) { loggedRelay = relay; logEvent(false, relay ? "[RELAY] pulse on" : "[RELAY] pulse off"); }
   bool park = parkSw.active;
-  if (park != loggedPark) { loggedPark = park; Serial.println(park ? "[PARK] confirmed" : "[PARK] not parked"); }
+  if (park != loggedPark) { loggedPark = park; logEvent(true, park ? "[PARK] confirmed" : "[PARK] not parked"); }
+}
+ 
+// Event time: wall clock once NTP has synced, otherwise boot number and uptime
+void fmtEventTime(const DiagEvent &e, char *out, size_t len) {
+  if (e.epoch) {
+    time_t t = e.epoch; struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(out, len, "%d.%m. %H:%M:%S", &tm);
+  } else {
+    unsigned long s = e.uptimeS;
+    snprintf(out, len, "boot %u +%02lu:%02lu:%02lu", (unsigned)e.boot, s / 3600, s / 60 % 60, s % 60);
+  }
+}
+ 
+// Minimal HTML escaping for /diag (event texts may contain an uploaded file name)
+void appendEscaped(String &h, const char* s) {
+  for (; *s; s++) {
+    if (*s == '<') h += "&lt;"; else if (*s == '>') h += "&gt;"; else if (*s == '&') h += "&amp;"; else h += *s;
+  }
+}
+ 
+void diagRow(String &h, const char* key, const char* value) {
+  h += "<tr><td>"; h += key; h += "</td><td>"; appendEscaped(h, value); h += "</td></tr>";
+}
+ 
+String buildDiagPage() {
+  char buf[96];
+  String h;
+  h.reserve(6000);
+  h += F("<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+         "<title>ESP32 Dome Diagnostics</title><style>body{background:#121212;color:#ddd;font-family:monospace;padding:1rem}"
+         "h1,h2{color:#0af;font-weight:600}table{border-collapse:collapse}td{padding:3px 14px 3px 0;vertical-align:top}"
+         "a{color:#888}</style></head><body><h1>Diagnostics</h1><table>");
+  time_t now = time(nullptr);
+  if (timeSynced(now)) { struct tm tm; localtime_r(&now, &tm); strftime(buf, sizeof(buf), "%d.%m.%Y %H:%M:%S", &tm); }
+  else snprintf(buf, sizeof(buf), "not synced (NTP)");
+  diagRow(h, "Time", buf);
+  unsigned long up = millis() / 1000;
+  snprintf(buf, sizeof(buf), "%lud %02lu:%02lu:%02lu", up / 86400, up / 3600 % 24, up / 60 % 60, up % 60);
+  diagRow(h, "Uptime", buf);
+  snprintf(buf, sizeof(buf), "%lu (counted since power-on)", (unsigned long)diag.bootCount);
+  diagRow(h, "Boot count", buf);
+  diagRow(h, "Last reset", resetReasonStr());
+  diagRow(h, "Firmware build", __DATE__ " " __TIME__);
+  if (WiFi.status() == WL_CONNECTED)
+    snprintf(buf, sizeof(buf), "%s, RSSI %d dBm, channel %d", WiFi.localIP().toString().c_str(), WiFi.RSSI(), (int)WiFi.channel());
+  else snprintf(buf, sizeof(buf), "not connected");
+  diagRow(h, "WiFi", buf);
+  snprintf(buf, sizeof(buf), "%lu since boot", (unsigned long)wifiLosses);
+  diagRow(h, "WiFi losses", buf);
+  if (alpacaSeen) snprintf(buf, sizeof(buf), "%lu s ago", (millis() - lastAlpacaMs) / 1000);
+  else snprintf(buf, sizeof(buf), "never since boot");
+  diagRow(h, "Last Alpaca request", buf);
+  snprintf(buf, sizeof(buf), "%lu free, %lu min free, %lu largest block",
+           (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
+  diagRow(h, "Heap (bytes)", buf);
+  h += F("</table><h2>Events (newest first)</h2><table>");
+  uint16_t count, next;
+  portENTER_CRITICAL(&diagMux); count = diag.count; next = diag.next; portEXIT_CRITICAL(&diagMux);
+  for (uint16_t i = 0; i < count; i++) {
+    DiagEvent e;
+    portENTER_CRITICAL(&diagMux); e = diag.ev[(next + DIAG_EVENTS - 1 - i) % DIAG_EVENTS]; portEXIT_CRITICAL(&diagMux);
+    fmtEventTime(e, buf, sizeof(buf));
+    diagRow(h, buf, e.text);
+  }
+  if (!count) h += F("<tr><td>no events</td></tr>");
+  h += F("</table><p><a href=\"/\">Back</a></p></body></html>");
+  return h;
 }
  
 // ========= ID Helper =========
@@ -362,6 +486,8 @@ uint32_t getClientID(AsyncWebServerRequest *r) {
  
 // ========= ALPACA RESPONSES =========
 void sendJson(AsyncWebServerRequest *r, const char* json) {
+    // Only device requests count as "client polling", not management/discovery or unknown URLs
+    if (r->url().startsWith("/api/")) { lastAlpacaMs = millis(); alpacaSeen = true; }
     r->send(r->beginResponse(200, "application/json", json));
 }
  
@@ -447,6 +573,9 @@ void registerHandlers() {
     root["parkConfirmed"] = (bool)parkSw.active;
     root["resetReason"] = resetReasonStr();
     root["uptimeS"] = millis() / 1000;
+    root["alpacaAgeS"] = alpacaSeen ? (long)((millis() - lastAlpacaMs) / 1000) : -1L;
+    root["alpacaOk"] = alpacaSeen && millis() - lastAlpacaMs < ALPACA_CLIENT_OK_S * 1000UL;
+    root["nextPulse"] = nextPulse == PULSE_OPENS ? "open" : nextPulse == PULSE_CLOSES ? "close" : "unknown";
     resp->setLength(); r->send(resp);
   });
  
@@ -474,6 +603,9 @@ void registerHandlers() {
     r->send(ok ? 200 : 409, "text/plain", ok ? "Fault reset" : "Reset requires stable endpoint and confirmed park");
   });
  
+  // 3b. DIAGNOSTICS (built on demand, not polled by the web UI)
+  server->on("/diag", HTTP_GET, [](AsyncWebServerRequest *r){ r->send(200, "text/html", buildDiagPage()); });
+ 
   // 4. SETUP
   server->on("/setup", HTTP_GET, [](AsyncWebServerRequest *r){
     String h = FPSTR(SETUP_HTML);
@@ -486,6 +618,7 @@ void registerHandlers() {
     preferences.putInt("alpaca_tcp", (int)port);
     r->send(200, "text/plain", "Saved. Rebooting as soon as the roof is idle and no fault is latched.");
     // No delay() here: it would block the async_tcp task. loop() restarts after the response is out.
+    restartReason = "setup saved";
     restartRequestedAt = millis(); restartPending = true;
   });
  
@@ -499,8 +632,14 @@ void registerHandlers() {
     // Called once the whole upload has been received
     [](AsyncWebServerRequest *r){
       if (otaRejected)        { r->send(409, "text/plain", "Rejected: roof must be closed and mount parked."); return; }
-      if (Update.hasError())  { otaInProgress = false; r->send(500, "text/plain", String("Update failed: ") + Update.errorString()); return; }
+      if (Update.hasError())  {
+        otaInProgress = false;
+        logEvent(true, "OTA failed: %s", Update.errorString());
+        r->send(500, "text/plain", String("Update failed: ") + Update.errorString()); return;
+      }
+      logEvent(true, "OTA ok");
       r->send(200, "text/plain", "Update OK. Rebooting...");
+      restartReason = "firmware update";
       restartRequestedAt = millis(); restartPending = true;   // otaInProgress stays set until reboot
     },
     // Called per chunk of the uploaded file
@@ -508,10 +647,10 @@ void registerHandlers() {
       if (index == 0) {
         // Only update in the safe rest position: a reboot then cannot interrupt anything
         otaRejected = !(currentShutterState == SHUTTER_CLOSED && !isSlewing && isSystemSafe());
-        if (otaRejected) return;
+        if (otaRejected) { logEvent(true, "OTA rejected: roof not closed or mount not parked"); return; }
         if (Update.isRunning()) Update.abort();   // leftover from an aborted upload
         otaInProgress = true; otaLastChunkAt = millis();
-        Serial.printf("OTA start: %s\n", filename.c_str());
+        logEvent(true, "OTA start: %s", filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) { Update.printError(Serial); return; }
       }
       if (otaRejected || !Update.isRunning()) return;
@@ -616,6 +755,9 @@ void initWiFi() {
   WiFi.setHostname(WIFI_HOSTNAME);   // before mode()/begin(), otherwise the default name is used
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  // Remember why the link dropped; logged by handleWiFi() from loop()
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) { wifiDisconnectReason = info.wifi_sta_disconnected.reason; },
+               ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.begin(SECRET_SSID, SECRET_PASS);
   Serial.print("Connecting to WiFi");
 }
@@ -625,7 +767,7 @@ void initWiFi() {
 void startDiscovery() {
 #if ENABLE_DISCOVERY
   udp.close();   // re-armed after every WiFi reconnect
-  if (!udp.listen(ALPACA_DISCOVERY_PORT)) { Serial.println("Alpaca discovery: listen failed"); return; }
+  if (!udp.listen(ALPACA_DISCOVERY_PORT)) { logEvent(true, "Alpaca discovery: listen failed"); return; }
   udp.onPacket([](AsyncUDPPacket packet) {
     if (packet.length() < 16 || strncmp((const char*)packet.data(), "alpacadiscovery1", 16) != 0) return;
     char resp[32];
@@ -635,28 +777,36 @@ void startDiscovery() {
 #endif
 }
  
+// Called on every (re)connect: discovery and NTP need a working link
+void onWiFiConnected() {
+  logEvent(true, "WiFi connected: %s, RSSI %d dBm", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  wifiEverUp = true;
+  startDiscovery();
+  configTzTime(TIME_ZONE, NTP_SERVER);
+}
+ 
 void handleWiFi() {
   unsigned long now = millis();
  
   if (WiFi.status() == WL_CONNECTED) {
-    if (wifiDown) {
-      Serial.println("\nWiFi Connected!");
-      Serial.print("IP: "); Serial.println(WiFi.localIP());
-      wifiDown = false;
-      startDiscovery();
-    }
+    if (wifiDown) { wifiDown = false; onWiFiConnected(); }
     return;
   }
   // Boot without a connection counts as down too
-  if (!wifiDown) { wifiDown = true; wifiDownSince = now; lastWifiCheck = now; Serial.println("WiFi down"); }
+  if (!wifiDown) {
+    wifiDown = true; wifiDownSince = now; lastWifiCheck = now; wifiLosses++;
+    uint8_t reason = wifiDisconnectReason;
+    logEvent(true, "WiFi %s: %s", wifiEverUp ? "lost" : "not connected",
+             reason ? WiFi.disconnectReasonName((wifi_err_reason_t)reason) : "no reason reported");
+  }
   if (now - lastWifiCheck >= WIFI_RETRY_INTERVAL) {
-    Serial.println("Reconnecting to WiFi...");
+    logEvent(false, "Reconnecting to WiFi...");
     WiFi.disconnect();
     WiFi.reconnect();
     lastWifiCheck = now;
   }
   if (now - wifiDownSince >= WIFI_REBOOT_AFTER_MS && rebootSafe()) {
-    Serial.println("WiFi down too long, rebooting");
+    logEvent(true, "Reboot: no WiFi for %lu min", WIFI_REBOOT_AFTER_MS / 60000UL);
     ESP.restart();
   }
 }
@@ -679,7 +829,10 @@ void initWatchdog() {
  
 void setup() {
   Serial.begin(115200);
-  Serial.printf("\nESP32 Dome Controller, build %s %s, reset reason: %s\n", __DATE__, __TIME__, resetReasonStr());
+  // Native USB (USB CDC On Boot): wait briefly for the host, otherwise the boot line is lost
+  while (!Serial && millis() < 1500) delay(10);
+  diagInit();
+  logEvent(true, "Boot #%lu: %s, build %s %s", (unsigned long)diag.bootCount, resetReasonStr(), __DATE__, __TIME__);
  
   digitalWrite(RELAY_PIN, !RELAY_ACTIVE_LEVEL); // set OFF level before enabling the output
   pinMode(RELAY_PIN, OUTPUT);
@@ -708,12 +861,11 @@ void setup() {
     delay(200); Serial.print("."); 
   }
   Serial.println("");
-  Serial.print("IP: "); Serial.println(WiFi.localIP());
  
   server = new AsyncWebServer(currentAlpacaPort);
   registerHandlers();
   server->begin();
-  if (WiFi.status() == WL_CONNECTED) startDiscovery();   // otherwise started by handleWiFi() on connect
+  if (WiFi.status() == WL_CONNECTED) onWiFiConnected();   // otherwise handleWiFi() does it on connect
  
   initWatchdog();   // armed last, so the blocking WiFi wait above cannot trip it
 }
@@ -724,6 +876,9 @@ void loop() {
   logStateChanges();
   handleWiFi();
   // Deferred while the roof moves or a fault is latched (a reboot would clear it)
-  if (restartPending && millis() - restartRequestedAt > 1000 && rebootSafe()) ESP.restart();
+  if (restartPending && millis() - restartRequestedAt > 1000 && rebootSafe()) {
+    logEvent(true, "Reboot: %s", restartReason);
+    ESP.restart();
+  }
 }
  
