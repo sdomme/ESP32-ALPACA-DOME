@@ -1,8 +1,7 @@
 # ESP32 Alpaca Roll-off Roof Controller
 
 ESP32 firmware that drives a roll-off roof through the push-button input of a single-button
-gate controller (open → stop → close → stop) and exposes it via ASCOM Alpaca as a **Dome**
-and a **Safety Monitor** (mount parked).
+gate controller (open → stop → close → stop) and exposes it via ASCOM Alpaca as a **Dome**.
 
 ## Park detection (light barrier)
 
@@ -23,7 +22,7 @@ The parked mount blocks a light barrier; its relay contact (NO) is the park sign
 
 ## Features
 
-- Alpaca Dome + Safety Monitor on port `11111`, UDP discovery on `32227`
+- Alpaca Dome on port `11111`, UDP discovery on `32227`
 - Roof commands are rejected unless the mount is parked
 - Faults latch (both end switches active, park lost while closing) until reset in the web UI
 - Web UI with status, open/close, confirmed overrides and fault reset
@@ -63,7 +62,7 @@ Further settings (timeouts, hostname, discovery, time zone) are at the top of th
 
 - Web UI: `http://<ip>:11111/`
 - Diagnostics: `http://<ip>:11111/diag` (event log with NTP time, survives reboots but not power loss; WiFi, heap, last Alpaca request)
-- NINA finds Dome and Safety Monitor via Alpaca discovery in the same network.
+- NINA finds the Dome via Alpaca discovery in the same network.
 
 ## Safety
 

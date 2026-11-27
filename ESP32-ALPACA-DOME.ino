@@ -2,7 +2,7 @@
   ESP32 Alpaca Roll-off Roof Controller
  
   Drives a roll-off roof through the push-button input of a single-button controller
-  (open -> stop -> close -> stop) and exposes it via ASCOM Alpaca as Dome and Safety Monitor.
+  (open -> stop -> close -> stop) and exposes it via ASCOM Alpaca as a Dome.
   The park position comes from a light barrier. Setup: see README.md.
 */
  
@@ -79,7 +79,6 @@ bool roofLost = false;             // latched fault, cleared only by resetRoofFa
 const char* roofErrorReason = "";  // why the position is unknown or the fault latched
 unsigned long faultAt = 0;
 bool domeConnected = false;
-bool safetyConnected = false;
 bool relayActive = false;
 unsigned long relayOnTime = 0;
 unsigned long relayOffTime = 0;
@@ -666,8 +665,7 @@ void registerHandlers() {
     sendAlpacaValue(r, "{\"ServerName\":\"ESP32 Observatory\",\"Manufacturer\":\"ESP32-ALPACA-DOME\",\"ManufacturerVersion\":\"1.0\",\"Location\":\"Observatory\"}");
   });
   server->on("/management/v1/configureddevices", HTTP_GET, [](AsyncWebServerRequest *r){
-    sendAlpacaValue(r, "[{\"DeviceName\":\"ESP32 Dome\",\"DeviceType\":\"Dome\",\"DeviceNumber\":0,\"UniqueID\":\"ESP32-DOME\"},"
-                        "{\"DeviceName\":\"ESP32 Safety\",\"DeviceType\":\"SafetyMonitor\",\"DeviceNumber\":0,\"UniqueID\":\"ESP32-SAFE\"}]");
+    sendAlpacaValue(r, "[{\"DeviceName\":\"ESP32 Dome\",\"DeviceType\":\"Dome\",\"DeviceNumber\":0,\"UniqueID\":\"ESP32-DOME\"}]");
   });
  
   // 6. ALPACA DOME (Device 0)
@@ -733,17 +731,6 @@ void registerHandlers() {
   server->on("/api/v1/dome/0/slewtoaltitude", HTTP_PUT, notImpl);
   server->on("/api/v1/dome/0/slewtoazimuth", HTTP_PUT, notImpl);
   server->on("/api/v1/dome/0/synctoazimuth", HTTP_PUT, notImpl);
- 
-  // 7. ALPACA SAFETY (Device 0)
-  server->on("/api/v1/safetymonitor/0/connected", HTTP_GET, [](AsyncWebServerRequest *r){ sendAlpacaBool(r, safetyConnected); });
-  server->on("/api/v1/safetymonitor/0/connected", HTTP_PUT, [](AsyncWebServerRequest *r){ putConnected(r, safetyConnected); });
-  // ASCOM: IsSafe must return false (not an error) while disconnected
-  server->on("/api/v1/safetymonitor/0/issafe", HTTP_GET, [](AsyncWebServerRequest *r){ sendAlpacaBool(r, safetyConnected && isSystemSafe()); });
-  server->on("/api/v1/safetymonitor/0/name", HTTP_GET, [](AsyncWebServerRequest *r){ sendAlpacaString(r, "ESP32 Safety"); });
-  server->on("/api/v1/safetymonitor/0/description", HTTP_GET, [](AsyncWebServerRequest *r){ sendAlpacaString(r, "ESP32 Safety Monitor"); });
-  server->on("/api/v1/safetymonitor/0/driverinfo", HTTP_GET, [](AsyncWebServerRequest *r){ sendAlpacaString(r, "ESP32 Async Driver"); });
-  server->on("/api/v1/safetymonitor/0/driverversion", HTTP_GET, [](AsyncWebServerRequest *r){ sendAlpacaString(r, "1.0"); });
-  server->on("/api/v1/safetymonitor/0/interfaceversion", HTTP_GET, [](AsyncWebServerRequest *r){ sendAlpacaInt(r, 1); });
  
   server->onNotFound([](AsyncWebServerRequest *r){ sendAlpacaResult(r, ERR_NOT_IMPLEMENTED, "Not Implemented"); });
 }
